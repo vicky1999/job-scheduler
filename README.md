@@ -52,7 +52,7 @@ The job scheduler currently supports 5 handlers
 
 ## Configuration
 
-- Create a .env file in the project root with the following configuration:
+- Create a .env file in the project root from `.env.example` with the following configuration:
 
 ```
 DATABASE_URL=postgresql+asyncpg://postgres:postgres@localhost:5432/db_scheduler
