@@ -20,6 +20,9 @@ Each tenant can create a job and schedule it to run at a specific time in future
 - Tenant layer handles tenant CRUD operation and data models
 - Job layer handles the job schema, models and controllers
 
+<img width="679" height="514" alt="image" src="https://github.com/user-attachments/assets/3549b06a-3a41-4ec7-a7b8-c1d73c1e86c4" />
+
+
 ## Worker Layer
 
 - The worker layer is used to execute a job scheduled for a particular time.
