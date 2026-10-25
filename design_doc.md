@@ -34,29 +34,12 @@ The runtime flow is:
 ## Data Model
 The main entities are Tenant and Job.
 
-
-Tenant
-- unique ID
-- tenant name
-- soft-delete support
-
-Job
-- ID, timestamps, and audit fields
-- tenant_id
-- scheduled_at
-- handler
-- payload
-- status (PENDING, RUNNING, COMPLETED, FAILED, SKIPPED)
-- retry_count
-- last_error
-- started_at / completed_at
-- locked_by
-- lease_expires_at
+<img width="679" height="514" alt="image" src="https://github.com/user-attachments/assets/6e80420b-1d14-400e-b769-a41db8b5b1c0" />
 
 The shared Base model includes creation and update timestamps and soft-delete flags so the system can safely hide records without permanently deleting them.
 
 ## Scheduling Model
-Jobs are eligible when they are pending, not deleted, and scheduled_at is less than or equal to the current time. The scheduler runs on a configurable poll interval and may process multiple jobs concurrently up to MAX_WORKERS.
+Jobs are eligible when they are pending, not deleted, and scheduled_at is less than or equal to the current time. The scheduler runs on a configurable poll interval and may process multiple jobs concurrently up to `MAX_WORKERS`.
 
 Execution uses a lease-based claim pattern:
 - when a worker selects a job, it marks it RUNNING
@@ -76,48 +59,46 @@ Each job points to a named handler in a registry. The registry maps a handler st
 
 ## API
 The API exposes CRUD operations for tenants and jobs:
-- GET /api/tenant/
-- GET /api/tenant/{tenant_id}
-- POST /api/tenant/
-- PUT /api/tenant/{tenant_id}
-- DELETE /api/tenant/{tenant_id}
 
-- GET /api/job/
-- GET /api/job/{job_id}
-- POST /api/job/
-- PUT /api/job/{job_id}
-- DELETE /api/job/{job_id}
+**Tenant**
 
-The API is intentionally straightforward and suitable for internal tools and integration with other services.
-
-## Operational Notes
-The system is designed for a single PostgreSQL-backed deployment with one or more worker processes. It is best suited for small-to-medium workloads and internal background processing use cases. The design is intentionally simple and maintainable, but it does not attempt to provide full distributed queue semantics or advanced orchestration.
+| HTTP Method | API Endpoint | Description |
+| --- | --- | --- |
+| GET | `/api/tenant/` | List all tenants |
+| GET | `/api/tenant/{tenant_id}` | Get tenant by ID |
+| POST | `/api/tenant/` | Create a new tenant |
+| PUT | `/api/tenant/{tenant_id}` | Update an existing tenant |
+| DELETE | `/api/tenant/{tenant_id}` | Delete a tenant |
+| GET | `/api/job/` | List all jobs |
+| GET | `/api/job/{job_id}` | Get job by ID |
+| POST | `/api/job/` | Create a new job |
+| PUT | `/api/job/{job_id}` | Update an existing job |
+| DELETE | `/api/job/{job_id}` | Delete a job |
 
 ## Risks and Future Improvements
-The main risks are duplicate processing under extreme edge cases, local fairness being process-scoped, and loosely validated JSON payloads. Future work could include stricter payload validation, priority queues, dead-letter handling, richer monitoring, and more robust distributed scheduling.
+The main risks are multi-tenant fairness locally, frequent DB queries, Re-processing of failed jobs. Future work could include centralized caching to poll jobs from DB less frequently, queue based job execution, dead-letter handling.
 
-## Summary
-The DB Scheduler provides a practical way to schedule and execute background jobs using a database as the source of truth. Its combination of durable storage, async workers, lease-based execution, and retry logic makes it a solid foundation for lightweight job processing and tenant-aware automation.
+### Frequent DB Queries
+- Currently, Jobs get polled from db every `POLL_INTERVAL` (in seconds).
+- To make the execution faster, it's set to 1 seconds which means db query will be made to poll the latest job that is not locked every second which could increase the number of connections as worker process and threads increase.
+- To optimize this, a centralized caching store could be used to poll all the jobs for the next 30 mins to an hour so, the jobs will be polled from DB less often and the scheduler workers can use the cache for execution.
+- This brings duplicate execution and can be handled by locking the particular queue as soon as it's picked up by a thread.
+- Currently, this duplicate execution is handled using db based locking using `WITH FOR UPDATE`.
 
-- `GET /api/job/` - list jobs, optional tenant filter
-- `GET /api/job/{job_id}` - fetch a job
-- `POST /api/job/` - create a job
-- `PUT /api/job/{job_id}` - update a pending job only
-- `DELETE /api/job/{job_id}` - soft delete a job
+### Re-Processing of failed jobs
+- The application retries a job with exponential backoff as soon as it failed and retries `MAX_RETRIES` times.
+- If the job failed on all the retries, the job will be marked as `FAILED` and the last error value will be saved in db.
+- This brings an issue where, whenever a job need to be re-processed or re-ran, it needs manual db change.
+- To fix this, a queueing system such as Kafka or Pub/sub which retries based on it's configuration and add the failed job to dead-letter queue for debugging can be used.
+- This helps in re-processing and checking the failed jobs and also, to re-run once fixed.
 
-### 9.3 Request Model example
-```json
-{
-  "tenant_id": "9d0cc1ca-6d7e-4d57-8485-fd2d3a7d78e1",
-  "name": "Send welcome email",
-  "description": "Send onboarding email to the tenant",
-  "scheduled_at": "2026-10-25T15:00:00Z",
-  "handler": "print",
-  "payload": {
-    "message": "Welcome! Your job was scheduled successfully."
-  }
-}
-```
+### Multi-tenancy Fairness
+- Currently, multi-tenant fairness is handled locally per worker process with round robin.
+- If 3 worker processes spin up, all will start from the first tenant and starts the first worker thread and the second tenant job for second thread, and third tenant job for third thread in a round robin fashion.  But since all three workers start from first tenant, even though round robin is handled on worker thread level, it could be extended to process level for more multi-tenant fairness.
+- To handle this, we can have a separate table or a cache which stores the last tenant and each worker process uses this to find the next tenant.  So, the job execution will look like:
+
+<img width="1287" height="488" alt="image" src="https://github.com/user-attachments/assets/08b5feb2-005b-4cba-999a-fe2ff1c2542c" />
+
 
 ## 10. Scheduler Design
 
@@ -269,21 +250,7 @@ For production use, the following should be added:
 - structured logging
 - environment-specific configuration
 
-## 18. Risks and Trade-offs
-
-### Risk: duplicate processing under worker crash
-Mitigation: lease renewal and expired-job recovery minimize this risk, though not perfect.
-
-### Risk: local tenant fairness is process-scoped
-The current implementation keeps a local in-memory cursor for fairness, which may not be globally fair across multiple workers. A database-backed strategy would be stronger in a distributed deployment.
-
-### Risk: job payloads are too loosely typed
-JSON payloads are flexible but weakly validated; stronger schema validation would improve safety and debuggability.
-
-### Risk: single-node deployment assumptions
-The current design is intentionally simple but is not a full distributed queueing system.
-
-## 19. Future Enhancements
+## 18. Future Enhancements
 
 - priority-based scheduling
 - exponential backoff with jitter
@@ -294,9 +261,3 @@ The current design is intentionally simple but is not a full distributed queuein
 - event-driven execution triggers
 - job cancellation and pause/resume behavior
 - job execution history and audit timeline
-
-## 20. Summary
-
-The DB Scheduler is a small but useful background processing system built around a durable queue stored in PostgreSQL. Its key strengths are simple persistence, clear job lifecycle management, lease-based execution safety, and built-in retries. It is well suited for internal use cases and as a foundation for more advanced scheduling systems.
-
-This design intentionally keeps the system simple and maintainable. It favors a single source of truth in the database, explicit scheduling logic, and pluggable handlers rather than a highly abstract distributed queue architecture.
