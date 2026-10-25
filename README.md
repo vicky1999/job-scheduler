@@ -1,6 +1,6 @@
 # Database backed Job Scheduler
 
-A multi-tenan job Scheduler application built using FastAPI, Postgres, FastAPI. 
+A multi-tenant job Scheduler application built using FastAPI, Postgres, FastAPI. 
 
 Each tenant can create a job and schedule it to run at a specific time in future
 
