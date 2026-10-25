@@ -17,11 +17,33 @@ scaled)**, each pulling due jobs and dispatching them to worker threads
 job must not be lost
 - Multi-tenant fairness
 
+## Tech Stack:
+
+- FastAPI
+  - FastAPI is chosen because it's lightweight and has built in background worker support.
+  - Since the project is not considering usage of external or scheduler or queues like redis, kafka, etc., using a framework like Django which offers many built-in features that are not required now.
+  - FastAPI is chosen over Django for speed and flexibility.
+  - Since speed is a key requirement and we are running the jobs asynchronously and need to be ran at the scheduled time, I chose FastAPI for its high performance and asynchronous support.
+
+- PostgreSQL
+  - Looking at the data model, each job and tenants are related. Here, a tenant can create multiple jobs.  Since the data is related, a relational database was chosen.
+  - Looking at other alternatives, postgres is chosen because of it's performance and scalability.
+
+- SQLAlchemy and Alembic
+  - SQLachemy is chosen as an ORM layer and alembic to handle db migrations better.
+  - It's easy and better to have the DB interaction done on an ORM layer than with raw queries and reduce the overhead of db migration.
+ 
+- uv
+  - Compared to pip and other dependency managers, `uv` is faster and also simplifies managing dependencies for a project.
+
 ## Architecture
 The system has three main components:
 1. **API layer** for creating, updating, and listing tenants and jobs
 2. **PostgreSQL** database for durable job state
 3. **Scheduler worker** that polls for due jobs and executes them
+
+<img width="568" height="308" alt="image" src="https://github.com/user-attachments/assets/934ff991-19de-450d-9584-6d4f527fc5f0" />
+
 
 The runtime flow is:
 - A client submits a job through the API
@@ -30,6 +52,7 @@ The runtime flow is:
 - A worker claims a job by updating its status and lease metadata
 - The worker executes the job handler and records the result
 - If the handler fails, the system retries based on defined rules or marks the job failed
+
 
 ## Data Model
 The main entities are Tenant and Job.
@@ -40,6 +63,8 @@ The shared Base model includes creation and update timestamps and soft-delete fl
 
 ## Scheduling Model
 Jobs are eligible when they are pending, not deleted, and scheduled_at is less than or equal to the current time. The scheduler runs on a configurable poll interval and may process multiple jobs concurrently up to `MAX_WORKERS`.
+
+<img width="985" height="1196" alt="image" src="https://github.com/user-attachments/assets/e7c4a2fa-04a4-4b86-8054-afec3a9cb94c" />
 
 Execution uses a lease-based claim pattern:
 - when a worker selects a job, it marks it RUNNING
@@ -82,7 +107,7 @@ The main risks are multi-tenant fairness locally, frequent DB queries, Re-proces
 - Currently, Jobs get polled from db every `POLL_INTERVAL` (in seconds).
 - To make the execution faster, it's set to 1 seconds which means db query will be made to poll the latest job that is not locked every second which could increase the number of connections as worker process and threads increase.
 - To optimize this, a centralized caching store could be used to poll all the jobs for the next 30 mins to an hour so, the jobs will be polled from DB less often and the scheduler workers can use the cache for execution.
-- This brings duplicate execution and can be handled by locking the particular queue as soon as it's picked up by a thread.
+- This brings back the problem of duplicate execution and can be handled by locking the particular queue as soon as it's picked up by a thread.
 - Currently, this duplicate execution is handled using db based locking using `WITH FOR UPDATE`.
 
 ### Re-Processing of failed jobs
@@ -100,9 +125,9 @@ The main risks are multi-tenant fairness locally, frequent DB queries, Re-proces
 <img width="1287" height="488" alt="image" src="https://github.com/user-attachments/assets/08b5feb2-005b-4cba-999a-fe2ff1c2542c" />
 
 
-## 10. Scheduler Design
+## Scheduler Design
 
-### 10.1 Core scheduler class
+### Core scheduler class
 The worker is implemented as `JobScheduler` and is responsible for:
 - job claim selection
 - execution orchestration
@@ -110,7 +135,7 @@ The worker is implemented as `JobScheduler` and is responsible for:
 - retry handling
 - expired job recovery
 
-### 10.2 Claiming strategy
+### Claiming strategy
 The scheduler selects a single eligible job using a SQL `UPDATE ... RETURNING` pattern with `FOR UPDATE SKIP LOCKED`-style semantics. The worker ensures that:
 - only jobs with `status = PENDING`
 - scheduled_at <= now
@@ -122,12 +147,12 @@ It then updates the row to `RUNNING` and stores:
 - `lease_expires_at`
 - `started_at`
 
-### 10.3 Lease design
+### Lease design
 A lease gives the scheduler a bounded execution window. While running, the job heartbeat renews the lease periodically. If the process dies or the heartbeat stops, the lease expires and the job can be recovered.
 
-This pattern reduces duplicate processing in cases where a worker crashes in the middle of execution.
+This pattern ensures the failed job will not be held by a thread and failed silently in cases where a worker crashes in the middle of execution.
 
-### 10.4 Execution strategy
+### Execution strategy
 Once a job is claimed, the worker creates two tasks:
 - one task executes the handler
 - one task performs heartbeat renewal until a stop signal is sent
@@ -136,7 +161,7 @@ The worker waits for whichever finishes first:
 - if the heartbeat stops first, the handler is cancelled and the job is treated as lost or failed
 - if the handler finishes first, the worker stops the heartbeat and commits final success state
 
-### 10.5 Retry policy
+### Retry policy
 The retry mechanism follows a simple exponential backoff model:
 
 ```python
@@ -145,14 +170,14 @@ retry_delay = 2 ** (retry_count + 1)
 
 This means retry intervals grow quickly for transient failures, reducing overload on a flaky worker.
 
-### 10.6 Recovery logic
+### Recovery logic
 Expired jobs are identified with:
 - status = RUNNING
 - lease_expires_at <= now
 
 These jobs are reset to `PENDING` or `FAILED`, depending on whether more retries remain. This ensures jobs can recover after crashes or long-running processing delays.
 
-## 11. Handler Model
+## Handler Model
 
 The execution layer uses a handler registry to map a string job type to an async callable.
 
@@ -167,21 +192,13 @@ Each handler receives the job payload and returns either:
 - a result payload to be stored in `result`
 - or an exception if execution fails
 
-### Handler contract
-- input: `payload: dict`
-- output: `dict` or any JSON-compatible structured result
-- exceptions should surface to the scheduler
-- unsupported handlers should raise `ValueError`
-
-## 12. Concurrency Model
+## Concurrency Model
 
 The scheduler supports a configurable maximum number of worker tasks:
 - `MAX_WORKERS` controls concurrent job processing
 - `POLL_INTERVAL` determines how frequently the scheduler checks for work
 
-This is a simple concurrency pattern suitable for single-node or small multi-node deployments where a single DB remains the source of truth.
-
-## 13. Data Integrity and Consistency
+## Data Integrity and Consistency
 
 ### Transaction boundaries
 - Creating a job is transactional
@@ -195,13 +212,12 @@ This is a simple concurrency pattern suitable for single-node or small multi-nod
 - Jobs are not deleted permanently; soft deletion avoids accidental data loss
 - The scheduler validates job state before completion to prevent overwriting newer work
 
-## 14. Failure Handling
+## Failure Handling
 
 ### Common failure modes
 - handler throws exception
 - worker crashes during execution
 - DB connection issue during lease renewal
-- lease expires while task still runs
 - unsupported handler name
 
 ### Behavior
@@ -210,54 +226,12 @@ This is a simple concurrency pattern suitable for single-node or small multi-nod
 - unsupported handlers fail fast with a clear error
 - DB errors are logged and surfaced appropriately
 
-## 15. Security Considerations
-
-- API should validate tenant creation and job payloads
-- Prevent arbitrary handler names from bypassing the registry
-- Use environment-based secrets for database credentials
-- Treat payloads as untrusted input until validated
-- Consider limiting the size of job payload fields and error messages
-
-## 16. Operational Considerations
-
-### Logging
-- Log every job claim, completion, retry, and failure
-- Include job_id, tenant_id, worker_id, and reason for failure
-
-### Monitoring
-Recommended operational metrics:
-- jobs queued
-- jobs processed per minute
-- retries per job
-- failed job count
-- expired lease count
-- average handler execution time
-
 ### Backups
 - Since job state is stored in PostgreSQL, standard database backups are required for recovery
 
-## 17. Deployment Model
+## Deployment Model
 
 The application is expected to run as:
-- one API service
+- one or more API services
 - one or more scheduler worker processes
 - one PostgreSQL database
-
-For production use, the following should be added:
-- process supervisor or container management
-- health checks
-- metrics collection
-- structured logging
-- environment-specific configuration
-
-## 18. Future Enhancements
-
-- priority-based scheduling
-- exponential backoff with jitter
-- dead-letter queue support
-- richer job analytics and dashboards
-- support for cron-like scheduling
-- per-handler validation schemas
-- event-driven execution triggers
-- job cancellation and pause/resume behavior
-- job execution history and audit timeline
