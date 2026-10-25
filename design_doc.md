@@ -100,31 +100,6 @@ The API exposes CRUD operations for tenants and jobs:
 | PUT | `/api/job/{job_id}` | Update an existing job |
 | DELETE | `/api/job/{job_id}` | Delete a job |
 
-## Risks and Future Improvements
-The main risks are multi-tenant fairness locally, frequent DB queries, Re-processing of failed jobs. Future work could include centralized caching to poll jobs from DB less frequently, queue based job execution, dead-letter handling.
-
-### Frequent DB Queries
-- Currently, Jobs get polled from db every `POLL_INTERVAL` (in seconds).
-- To make the execution faster, it's set to 1 seconds which means db query will be made to poll the latest job that is not locked every second which could increase the number of connections as worker process and threads increase.
-- To optimize this, a centralized caching store could be used to poll all the jobs for the next 30 mins to an hour so, the jobs will be polled from DB less often and the scheduler workers can use the cache for execution.
-- This brings back the problem of duplicate execution and can be handled by locking the particular queue as soon as it's picked up by a thread.
-- Currently, this duplicate execution is handled using db based locking using `WITH FOR UPDATE`.
-
-### Re-Processing of failed jobs
-- The application retries a job with exponential backoff as soon as it failed and retries `MAX_RETRIES` times.
-- If the job failed on all the retries, the job will be marked as `FAILED` and the last error value will be saved in db.
-- This brings an issue where, whenever a job need to be re-processed or re-ran, it needs manual db change.
-- To fix this, a queueing system such as Kafka or Pub/sub which retries based on it's configuration and add the failed job to dead-letter queue for debugging can be used.
-- This helps in re-processing and checking the failed jobs and also, to re-run once fixed.
-
-### Multi-tenancy Fairness
-- Currently, multi-tenant fairness is handled locally per worker process with round robin.
-- If 3 worker processes spin up, all will start from the first tenant and starts the first worker thread and the second tenant job for second thread, and third tenant job for third thread in a round robin fashion.  But since all three workers start from first tenant, even though round robin is handled on worker thread level, it could be extended to process level for more multi-tenant fairness.
-- To handle this, we can have a separate table or a cache which stores the last tenant and each worker process uses this to find the next tenant.  So, the job execution will look like:
-
-<img width="1287" height="488" alt="image" src="https://github.com/user-attachments/assets/08b5feb2-005b-4cba-999a-fe2ff1c2542c" />
-
-
 ## Scheduler Design
 
 ### Core scheduler class
@@ -198,40 +173,62 @@ The scheduler supports a configurable maximum number of worker tasks:
 - `MAX_WORKERS` controls concurrent job processing
 - `POLL_INTERVAL` determines how frequently the scheduler checks for work
 
-## Data Integrity and Consistency
-
-### Transaction boundaries
-- Creating a job is transactional
-- Claiming a job is transactional
-- Lease renewal is transactional
-- Completion updates are transactional
-- Recovery uses transactional updates to requeue or mark failure
-
 ### Safety guarantees
 - Only one worker should win a claim at a time because the claim update validates the current database state
 - Jobs are not deleted permanently; soft deletion avoids accidental data loss
 - The scheduler validates job state before completion to prevent overwriting newer work
 
-## Failure Handling
 
-### Common failure modes
-- handler throws exception
-- worker crashes during execution
-- DB connection issue during lease renewal
-- unsupported handler name
+## How the Current System Handles the Requirements
 
-### Behavior
-- transient handler exceptions trigger retry logic
-- lease expiry triggers recovery
-- unsupported handlers fail fast with a clear error
-- DB errors are logged and surfaced appropriately
+### Exactly-once execution
+-  Only one worker claims a job at a time, but a crash before completion is recorded can cause the job to run again.
+-  Only one worker can claim a job at a time.
+-  This is handled using database backed locking using `WITH FOR UPDATE` and the query skips locked rows.  So, the rows locked by once worker thread will not cause any duplicate execution
 
-### Backups
-- Since job state is stored in PostgreSQL, standard database backups are required for recovery
+### Workers can crash at any point
+- If the handler fails, the job will retry again after an exponential backoff, but not concurrently with its previous attempt.
+- Maximum retries will be configured in `MAX_RETRIES` and is default to 3.
+- If a handler fails all three retries, it will be marked as FAILED and will not be retried again.
 
-## Deployment Model
+### Fair resource sharing
+- The scheduler uses a per-process tenant cursor to give tenants a best-effort turn in a round robin fashion.
+- For 3 tenants A, B and C, a worker will execute the jobs like: `Tenant A` -> `Tenant B` -> `Tenant C`
 
-The application is expected to run as:
-- one or more API services
-- one or more scheduler worker processes
-- one PostgreSQL database
+### Jobs have a schedule
+- Workers poll the database every second by default and run jobs whose scheduled time has arrived.
+- If a job is scheduled in the past but the server is idle or not online, it will be executed as soon as it's started.
+- Reason for this is being, the job need to be executed at the earliest time and should never be kept pending silently.
+- Jobs remain `PENDING` in DB while the worker is offline, so running overdue jobs after it restarts helps ensure requested work is not silently lost.
+
+### Scaling 
+- As the usage grows, the worker can be scaled by increasing `MAX_WORKERS` that spin up more worker threads per process
+- For a higher job rate, the system can be scaled horizontally by running more worker processes which adds `MAX_WORKERS` processes to run concurrently.
+- Higher workers and processes will result in higher query rate.  So, as the usage grows, one improvement is to move to a centralized cache with locking poll the pending jobs from the cache instead of relying on DB. This reduces the db load and helps scale much higher.
+- As the scale grows to 100X, It will be suitable to have a centralized queuing system that triggers the worker threads instead of handling the concurrent connections on the worker level.
+
+
+## Risks and Future Improvements
+The main risks are multi-tenant fairness locally, frequent DB queries, Re-processing of failed jobs. Future work could include centralized caching to poll jobs from DB less frequently, queue based job execution, dead-letter handling.
+
+### Frequent DB Queries
+- Currently, Jobs get polled from db every `POLL_INTERVAL` (in seconds).
+- To make the execution faster, it's set to 1 seconds which means db query will be made to poll the latest job that is not locked every second which could increase the number of connections as worker process and threads increase.
+- To optimize this, a centralized caching store could be used to poll all the jobs for the next 30 mins to an hour so, the jobs will be polled from DB less often and the scheduler workers can use the cache for execution.
+- This brings back the problem of duplicate execution and can be handled by locking the particular queue as soon as it's picked up by a thread.
+- Currently, this duplicate execution is handled using db based locking using `WITH FOR UPDATE`.
+
+### Re-Processing of failed jobs
+- The application retries a job with exponential backoff as soon as it failed and retries `MAX_RETRIES` times.
+- If the job failed on all the retries, the job will be marked as `FAILED` and the last error value will be saved in db.
+- This brings an issue where, whenever a job need to be re-processed or re-ran, it needs manual db change.
+- To fix this, a queueing system such as Kafka or Pub/sub which retries based on it's configuration and add the failed job to dead-letter queue for debugging can be used.
+- This helps in re-processing and checking the failed jobs and also, to re-run once fixed.
+
+### Multi-tenancy Fairness
+- Currently, multi-tenant fairness is handled locally per worker process with round robin.
+- If 3 worker processes spin up, all will start from the first tenant and starts the first worker thread and the second tenant job for second thread, and third tenant job for third thread in a round robin fashion.  But since all three workers start from first tenant, even though round robin is handled on worker thread level, it could be extended to process level for more multi-tenant fairness.
+- To handle this, we can have a separate table or a cache which stores the last tenant and each worker process uses this to find the next tenant.  So, the job execution will look like:
+
+<img width="1287" height="488" alt="image" src="https://github.com/user-attachments/assets/08b5feb2-005b-4cba-999a-fe2ff1c2542c" />
+
