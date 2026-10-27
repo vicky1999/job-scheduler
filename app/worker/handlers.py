@@ -31,8 +31,8 @@ async def fibonacci_handler(payload: dict[str, Any]):
 
 async def sleep_handler(payload: dict[str, Any]) -> dict[str, Any]:
     seconds = float(payload.get("seconds", 1))
-    if not 0 <= seconds <= 3600:
-        raise ValueError("seconds must be between 0 and 3600")
+    if not 0 <= seconds <= 60:
+        raise ValueError("seconds must be between 0 and 60")
 
     await asyncio.sleep(seconds)
     return {"slept_seconds": seconds}
